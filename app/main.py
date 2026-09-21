@@ -6,7 +6,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Query
 
-from .planner import InfeasibleError, plan_pages
+from .planner import InfeasibleError, plan_pages, validate_break_constraints
 from .schemas import PlanOut, PlanRequest, PlanSummary
 from .storage import PlanStore
 
@@ -24,13 +24,15 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="乐谱安全翻页规划 API",
-    version="1.1.0",
+    version="1.2.0",
     description=(
         "提交按顺序排列的谱面系统高度、边界休止秒数、页面可用高度与最低安全休止，"
         "动态规划生成完整分页方案：页面不超高、仅在达标边界翻页，"
         "依次最大化最短翻页休止、最小化各页留白平方和、减少页数。"
         "支持 single 单页模式与 spread 双页谱架模式（相邻左右页同组可见，"
         "组内边界不检查休止，仅翻过右页的实体翻页要求达标休止）。"
+        "另支持人工断点约束 forced_break_after（必须分页）与 "
+        "forbidden_break_after（禁止分页）。"
     ),
     lifespan=lifespan,
 )
@@ -45,9 +47,11 @@ def _to_plan_out(record: dict) -> PlanOut:
         boundary_rests=req["boundary_rests"],
         page_height=req["page_height"],
         min_safe_rest=req["min_safe_rest"],
-        # 旧记录没有新增字段，按 single 模式默认值回放
+        # 旧记录没有新增字段，按默认值回放
         layout_mode=req.get("layout_mode", "single"),
         spread_start_side=req.get("spread_start_side"),
+        forced_break_after=req.get("forced_break_after", []),
+        forbidden_break_after=req.get("forbidden_break_after", []),
         system_count=len(req["system_heights"]),
         page_count=res["page_count"],
         min_turn_rest=res["min_turn_rest"],
@@ -63,7 +67,19 @@ def health() -> dict:
 
 @app.post("/plans", status_code=201, response_model=PlanOut)
 def create_plan(req: PlanRequest) -> PlanOut:
-    """生成并保存完整分页方案；无解时返回 422 及首个问题区间，不保存任何部分方案。"""
+    """生成并保存完整分页方案；无解或约束冲突时返回 422，不保存任何部分方案。"""
+    conflicts = validate_break_constraints(
+        len(req.system_heights), req.forced_break_after, req.forbidden_break_after
+    )
+    if conflicts:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "error": "invalid_break_constraints",
+                "conflicts": conflicts,
+                "message": "人工断点约束存在冲突，无法执行分页规划",
+            },
+        )
     try:
         result = plan_pages(
             req.system_heights,
@@ -72,6 +88,8 @@ def create_plan(req: PlanRequest) -> PlanOut:
             req.min_safe_rest,
             layout_mode=req.layout_mode,
             spread_start_side=req.spread_start_side,
+            forced_break_after=req.forced_break_after,
+            forbidden_break_after=req.forbidden_break_after,
         )
     except InfeasibleError as exc:
         raise HTTPException(

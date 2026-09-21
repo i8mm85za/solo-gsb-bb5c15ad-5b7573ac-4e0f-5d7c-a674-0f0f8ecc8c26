@@ -160,3 +160,132 @@ def test_spread_infeasible_diagnosis(client):
     assert detail["boundary_index"] == 1
     assert detail["physical_turn"] is True
     assert client.get("/plans").json() == []  # 不保存部分方案
+
+
+# ---- 人工断点约束 ----
+
+
+CONSTRAINT_BODY = {
+    "system_heights": [5.0, 5.0, 5.0],
+    "boundary_rests": [5.0, 3.0],
+    "page_height": 10.0,
+    "min_safe_rest": 1.0,
+}
+
+
+def test_break_constraints_default_to_empty(client):
+    r = client.post("/plans", json=CONSTRAINT_BODY)
+    assert r.status_code == 201, r.text
+    plan = r.json()
+    assert plan["forced_break_after"] == []
+    assert plan["forbidden_break_after"] == []
+    # SQLite 回放同样保留两组约束
+    assert client.get(f"/plans/{plan['id']}").json()["forced_break_after"] == []
+    assert client.get(f"/plans/{plan['id']}").json()["forbidden_break_after"] == []
+
+
+def test_forced_break_create_and_replay(client):
+    body = dict(CONSTRAINT_BODY, forced_break_after=[1])
+    r = client.post("/plans", json=body)
+    assert r.status_code == 201, r.text
+    plan = r.json()
+    # 系统 1 后必须分页 → [0,1]|[2]，瓶颈降为 3.0
+    assert [p["end_system"] for p in plan["pages"]] == [1, 2]
+    assert plan["forced_break_after"] == [1]
+    assert plan["forbidden_break_after"] == []
+    # 回放保留约束
+    got = client.get(f"/plans/{plan['id']}").json()
+    assert got["forced_break_after"] == [1]
+    assert got["forbidden_break_after"] == []
+    assert got == plan
+
+
+def test_forbidden_break_create_and_replay(client):
+    body = dict(CONSTRAINT_BODY, forbidden_break_after=[0])
+    r = client.post("/plans", json=body)
+    assert r.status_code == 201, r.text
+    plan = r.json()
+    assert 0 not in [p["end_system"] for p in plan["pages"]]
+    assert plan["forbidden_break_after"] == [0]
+    assert client.get(f"/plans/{plan['id']}").json() == plan
+
+
+def test_spread_forced_break_inside_group_no_rest_check(client):
+    # 强制断在左页后（组内）：休止 0.1 不检查、不算实体翻页
+    body = {
+        "system_heights": [4.0, 4.0, 4.0],
+        "boundary_rests": [0.1, 9.0],
+        "page_height": 10.0,
+        "min_safe_rest": 1.0,
+        "layout_mode": "spread",
+        "forced_break_after": [0],
+    }
+    r = client.post("/plans", json=body)
+    assert r.status_code == 201, r.text
+    plan = r.json()
+    assert [p["physical_turn_after"] for p in plan["pages"]] == [False, False]
+    assert plan["min_turn_rest"] is None
+    assert client.get(f"/plans/{plan['id']}").json()["forced_break_after"] == [0]
+
+
+def test_overlapping_constraints_422(client):
+    body = dict(CONSTRAINT_BODY, forced_break_after=[1], forbidden_break_after=[1])
+    r = client.post("/plans", json=body)
+    assert r.status_code == 422
+    detail = r.json()["detail"]
+    assert detail["error"] == "invalid_break_constraints"
+    types = [c["type"] for c in detail["conflicts"]]
+    assert "overlap" in types
+    conflict = next(c for c in detail["conflicts"] if c["type"] == "overlap")
+    assert conflict["system_index"] == 1
+    assert client.get("/plans").json() == []  # 不保存
+
+
+def test_constraint_pointing_to_last_system_422(client):
+    body = dict(CONSTRAINT_BODY, forced_break_after=[2])
+    r = client.post("/plans", json=body)
+    assert r.status_code == 422
+    detail = r.json()["detail"]
+    assert detail["error"] == "invalid_break_constraints"
+    conflict = detail["conflicts"][0]
+    assert conflict["type"] == "points_to_last_system"
+    assert conflict["system_index"] == 2
+    assert client.get("/plans").json() == []
+
+    body = dict(CONSTRAINT_BODY, forbidden_break_after=[2])
+    r = client.post("/plans", json=body)
+    assert r.status_code == 422
+    assert r.json()["detail"]["conflicts"][0]["type"] == "points_to_last_system"
+
+
+def test_negative_constraint_index_422(client):
+    body = dict(CONSTRAINT_BODY, forced_break_after=[-1])
+    assert client.post("/plans", json=body).status_code == 422
+
+
+def test_constraint_makes_plan_infeasible_422_and_saves_nothing(client):
+    # 边界 1 禁止分页，但系统 1、2 同页 12 > 10 → 无解，沿用既有诊断格式
+    body = {
+        "system_heights": [6.0, 6.0, 6.0],
+        "boundary_rests": [8.0, 0.2],
+        "page_height": 10.0,
+        "min_safe_rest": 1.0,
+        "forbidden_break_after": [1],
+    }
+    r = client.post("/plans", json=body)
+    assert r.status_code == 422
+    detail = r.json()["detail"]
+    assert detail["error"] == "no_feasible_pagination"
+    assert detail["reason"] == "unsafe_boundary"
+    assert detail["boundary_index"] == 1
+    assert detail["forbidden_break_after"] == 1
+    assert client.get("/plans").json() == []
+
+
+def test_constraint_indices_normalized(client):
+    # 重复下标去重并排序后回放
+    body = dict(CONSTRAINT_BODY, forced_break_after=[1, 0, 1])
+    r = client.post("/plans", json=body)
+    assert r.status_code == 201, r.text
+    plan = r.json()
+    assert plan["forced_break_after"] == [0, 1]

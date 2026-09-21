@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import pytest
 
-from app.planner import InfeasibleError, plan_pages
+from app.planner import InfeasibleError, plan_pages, validate_break_constraints
 
 
 def test_single_page_when_everything_fits():
@@ -247,3 +247,179 @@ def test_spread_single_system():
     assert res["pages"][0]["side"] == "right"
     assert res["pages"][0]["physical_turn_after"] is False
     assert res["min_turn_rest"] is None
+
+
+# ---- 人工断点约束：forced_break_after / forbidden_break_after ----
+
+
+def test_break_constraints_default_empty():
+    # 不传约束时行为与此前完全一致
+    res = plan_pages([5.0, 5.0, 5.0], [5.0, 3.0], 10.0, 1.0)
+    assert [p["end_system"] for p in res["pages"]] == [0, 2]
+
+
+def test_validate_break_constraint_conflicts():
+    # 重叠
+    conflicts = validate_break_constraints(3, [1], [1])
+    assert len(conflicts) == 1
+    assert conflicts[0]["type"] == "overlap"
+    assert conflicts[0]["system_index"] == 1
+    # 指向末系统
+    assert [c["type"] for c in validate_break_constraints(3, [2], [])] == [
+        "points_to_last_system"
+    ]
+    assert [c["type"] for c in validate_break_constraints(3, [], [2])] == [
+        "points_to_last_system"
+    ]
+    # 越界
+    conflicts = validate_break_constraints(3, [3], [])
+    assert conflicts[0]["type"] == "index_out_of_range"
+    assert conflicts[0]["system_index"] == 3
+    # 无冲突
+    assert validate_break_constraints(3, [0], [1]) == []
+    assert validate_break_constraints(1, [], []) == []
+    # n=1 时下标 0 即末系统
+    assert [c["type"] for c in validate_break_constraints(1, [0], [])] == [
+        "points_to_last_system"
+    ]
+
+
+def test_plan_pages_rejects_conflicting_constraints():
+    with pytest.raises(ValueError):
+        plan_pages([1.0, 1.0], [1.0], 10.0, 1.0, forced_break_after=[1])
+    with pytest.raises(ValueError):
+        plan_pages(
+            [1.0, 1.0], [1.0], 10.0, 1.0,
+            forced_break_after=[0], forbidden_break_after=[0],
+        )
+
+
+def test_single_forced_break_changes_cut():
+    # 默认最优 [0]|[1,2]（瓶颈 5）；强制系统 1 后分页 → [0,1]|[2]（瓶颈 3）
+    res = plan_pages([5.0, 5.0, 5.0], [5.0, 3.0], 10.0, 1.0, forced_break_after=[1])
+    assert [p["end_system"] for p in res["pages"]] == [1, 2]
+    assert res["min_turn_rest"] == 3.0
+    # 强制系统 0 后分页，默认切分恰好满足
+    res = plan_pages([5.0, 5.0, 5.0], [5.0, 3.0], 10.0, 1.0, forced_break_after=[0])
+    assert [p["end_system"] for p in res["pages"]] == [0, 2]
+    assert res["min_turn_rest"] == 5.0
+
+
+def test_single_forced_break_every_boundary():
+    res = plan_pages(
+        [5.0, 5.0, 5.0], [5.0, 5.0], 10.0, 1.0, forced_break_after=[0, 1]
+    )
+    assert [p["end_system"] for p in res["pages"]] == [0, 1, 2]
+    assert res["page_count"] == 3
+
+
+def test_single_forbidden_break_must_span():
+    res = plan_pages(
+        [5.0, 5.0, 5.0], [5.0, 3.0], 10.0, 1.0, forbidden_break_after=[0]
+    )
+    assert [p["end_system"] for p in res["pages"]] == [1, 2]
+    res = plan_pages(
+        [5.0, 5.0, 5.0], [5.0, 3.0], 10.0, 1.0, forbidden_break_after=[1]
+    )
+    assert [p["end_system"] for p in res["pages"]] == [0, 2]
+
+
+def test_single_forbidden_break_infeasible_when_span_overheight():
+    # 系统 1、2 同页 12 > 10，边界 1 又禁止分页 → 无解，诊断落在该禁止边界
+    with pytest.raises(InfeasibleError) as exc:
+        plan_pages(
+            [6.0, 6.0, 6.0], [8.0, 0.2], 10.0, 1.0, forbidden_break_after=[1]
+        )
+    assert exc.value.reason == "unsafe_boundary"
+    assert exc.value.detail["boundary_index"] == 1
+    assert exc.value.detail["forbidden_break_after"] == 1
+
+
+def test_single_forced_break_on_unsafe_boundary_infeasible():
+    # 强制在休止不足的边界分页 → 无解且诊断标注 forced_break_after
+    with pytest.raises(InfeasibleError) as exc:
+        plan_pages(
+            [5.0, 5.0, 5.0], [0.2, 9.0], 10.0, 1.0, forced_break_after=[0]
+        )
+    assert exc.value.reason == "unsafe_boundary"
+    assert exc.value.detail["boundary_index"] == 0
+    assert exc.value.detail["forced_break_after"] == 0
+
+
+def test_forced_and_forbidden_together():
+    res = plan_pages(
+        [5.0, 5.0, 5.0, 5.0], [9.0, 9.0, 9.0], 10.0, 1.0,
+        forced_break_after=[0], forbidden_break_after=[2],
+    )
+    ends = [p["end_system"] for p in res["pages"]]
+    assert ends[0] == 0
+    assert 2 not in ends
+
+
+def test_spread_forced_break_inside_group_is_not_physical():
+    # [4,4,4] spread left：默认 [0,1]|[2] 无实体翻页。
+    # 强制系统 0 后分页 → [0]|[1,2]：断出的左页后仍是组内边界，
+    # 休止 0.1 不检查、不算实体翻页、不参与瓶颈（min_turn_rest 仍为 None）
+    res = plan_pages(
+        [4.0, 4.0, 4.0], [0.1, 9.0], 10.0, 1.0,
+        layout_mode="spread", forced_break_after=[0],
+    )
+    assert [p["end_system"] for p in res["pages"]] == [0, 2]
+    assert [p["side"] for p in res["pages"]] == ["left", "right"]
+    assert [p["physical_turn_after"] for p in res["pages"]] == [False, False]
+    assert res["pages"][0]["turn_rest_after"] is None
+    assert res["min_turn_rest"] is None
+
+
+def test_spread_forced_break_after_right_page_checks_rest():
+    # 强制分页后该页为右页时才是实体翻页：休止 9 参与瓶颈
+    res = plan_pages(
+        [4.0, 6.0, 6.0], [0.1, 9.0], 10.0, 1.0,
+        layout_mode="spread", forced_break_after=[0],
+    )
+    assert [p["end_system"] for p in res["pages"]] == [0, 1, 2]
+    assert [p["physical_turn_after"] for p in res["pages"]] == [False, True, False]
+    assert res["pages"][1]["turn_rest_after"] == 9.0
+    assert res["min_turn_rest"] == 9.0
+
+
+def test_spread_forced_physical_turn_below_min_rest_infeasible():
+    with pytest.raises(InfeasibleError) as exc:
+        plan_pages(
+            [6.0, 6.0, 6.0], [8.0, 0.2], 10.0, 1.0,
+            layout_mode="spread", forced_break_after=[1],
+        )
+    assert exc.value.reason == "unsafe_boundary"
+    assert exc.value.detail["boundary_index"] == 1
+    assert exc.value.detail.get("physical_turn") is True
+    assert exc.value.detail["forced_break_after"] == 1
+
+
+def test_spread_forbidden_break_must_span():
+    res = plan_pages(
+        [3.0, 3.0, 3.0], [0.1, 8.0], 10.0, 1.0,
+        layout_mode="spread", forbidden_break_after=[1],
+    )
+    assert 1 not in [p["end_system"] for p in res["pages"]]
+
+
+def test_spread_forbidden_break_infeasible():
+    # 每页最多容纳一个系统，边界 1 禁止分页 → 无法跨越
+    with pytest.raises(InfeasibleError) as exc:
+        plan_pages(
+            [6.0, 6.0, 6.0, 6.0], [0.1, 9.0, 0.1], 10.0, 1.0,
+            layout_mode="spread", forbidden_break_after=[1],
+        )
+    assert exc.value.reason == "unsafe_boundary"
+    assert exc.value.detail["boundary_index"] == 1
+    assert exc.value.detail["forbidden_break_after"] == 1
+
+
+def test_forbidden_break_does_not_reduce_bottleneck():
+    # 禁止边界 1 分页后仍存在全部实体翻页休止为 9 的切分
+    res = plan_pages(
+        [5.0, 5.0, 5.0, 5.0], [9.0, 3.0, 9.0], 10.0, 1.0,
+        forbidden_break_after=[1],
+    )
+    assert 1 not in [p["end_system"] for p in res["pages"]]
+    assert res["min_turn_rest"] == 9.0
