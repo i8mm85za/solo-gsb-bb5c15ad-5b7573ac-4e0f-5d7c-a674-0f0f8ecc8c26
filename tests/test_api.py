@@ -160,3 +160,120 @@ def test_spread_infeasible_diagnosis(client):
     assert detail["boundary_index"] == 1
     assert detail["physical_turn"] is True
     assert client.get("/plans").json() == []  # 不保存部分方案
+
+
+# ---- 人工断点约束 ----
+
+CONSTRAINED_BODY = {
+    "system_heights": [100.0, 100.0, 100.0, 100.0],
+    "boundary_rests": [5.0, 5.0, 5.0],
+    "page_height": 200.0,
+    "min_safe_rest": 1.0,
+    "forced_break_after": [1],
+    "forbidden_break_after": [2],
+}
+
+
+def test_break_constraints_default_empty(client):
+    r = client.post("/plans", json=GOOD_BODY)
+    assert r.status_code == 201, r.text
+    plan = r.json()
+    assert plan["forced_break_after"] == []
+    assert plan["forbidden_break_after"] == []
+
+
+def test_break_constraints_create_and_replay(client):
+    r = client.post("/plans", json=CONSTRAINED_BODY)
+    assert r.status_code == 201, r.text
+    plan = r.json()
+    assert plan["forced_break_after"] == [1]
+    assert plan["forbidden_break_after"] == [2]
+    # 唯一的分页点在系统 1 之后（强制），系统 2 之后不分页（禁止）
+    assert [p["end_system"] for p in plan["pages"][:-1]] == [1]
+
+    # SQLite 回放保留两组约束
+    got = client.get(f"/plans/{plan['id']}")
+    assert got.status_code == 200
+    assert got.json() == plan
+
+
+def test_break_constraints_conflict_422(client):
+    body = dict(CONSTRAINED_BODY, forced_break_after=[1, 2], forbidden_break_after=[2])
+    r = client.post("/plans", json=body)
+    assert r.status_code == 422
+    assert "2" in str(r.json()["detail"])  # 给出具体冲突下标
+    assert client.get("/plans").json() == []  # 不保存任何方案
+
+
+def test_break_constraint_on_last_system_422(client):
+    # 指向末系统
+    r = client.post("/plans", json=dict(CONSTRAINED_BODY, forced_break_after=[3],
+                                        forbidden_break_after=[]))
+    assert r.status_code == 422
+    r = client.post("/plans", json=dict(CONSTRAINED_BODY, forbidden_break_after=[3],
+                                        forced_break_after=[]))
+    assert r.status_code == 422
+    # 越界下标同样 422
+    r = client.post("/plans", json=dict(CONSTRAINED_BODY, forced_break_after=[4],
+                                        forbidden_break_after=[]))
+    assert r.status_code == 422
+    assert client.get("/plans").json() == []
+
+
+def test_infeasible_due_to_forbidden_break_saves_nothing(client):
+    # 禁止在系统 0 后分页，但系统 0、1 超高无法同页 → 422 且不保存
+    body = {
+        "system_heights": [6.0, 6.0, 6.0],
+        "boundary_rests": [9.0, 9.0],
+        "page_height": 10.0,
+        "min_safe_rest": 1.0,
+        "forbidden_break_after": [0],
+    }
+    r = client.post("/plans", json=body)
+    assert r.status_code == 422
+    detail = r.json()["detail"]
+    assert detail["error"] == "no_feasible_pagination"
+    assert detail["reason"] == "unsafe_boundary"
+    assert detail["boundary_index"] == 0
+    assert detail["forbidden_break"] is True
+    assert client.get("/plans").json() == []
+
+
+def test_forced_break_with_insufficient_rest_422(client):
+    # 强制分页处休止不足 → 沿用现有无解诊断，不保存
+    body = {
+        "system_heights": [5.0, 5.0, 5.0],
+        "boundary_rests": [0.5, 9.0],
+        "page_height": 10.0,
+        "min_safe_rest": 1.0,
+        "forced_break_after": [0],
+    }
+    r = client.post("/plans", json=body)
+    assert r.status_code == 422
+    detail = r.json()["detail"]
+    assert detail["reason"] == "unsafe_boundary"
+    assert detail["boundary_index"] == 0
+    assert detail["forced_break"] is True
+    assert client.get("/plans").json() == []
+
+
+def test_spread_forced_break_within_group_not_physical(client):
+    # spread 组内（左页之后）的强制断点不算实体翻页、不检查休止：
+    # 若被当作实体翻页，边界 0 的休止 0.0 < 1.0 将无解
+    body = {
+        "system_heights": [6.0, 4.0, 6.0],
+        "boundary_rests": [0.0, 8.0],
+        "page_height": 10.0,
+        "min_safe_rest": 1.0,
+        "layout_mode": "spread",
+        "forced_break_after": [0],
+    }
+    r = client.post("/plans", json=body)
+    assert r.status_code == 201, r.text
+    plan = r.json()
+    assert plan["forced_break_after"] == [0]
+    assert [p["side"] for p in plan["pages"]] == ["left", "right"]
+    assert plan["pages"][0]["end_system"] == 0  # 强制断点生效
+    assert plan["pages"][0]["physical_turn_after"] is False
+    assert plan["pages"][0]["turn_rest_after"] is None
+    assert plan["min_turn_rest"] is None

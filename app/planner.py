@@ -11,7 +11,11 @@
   （最后一页之后无需翻页）；
 - spread：相邻左、右页组成一组同时可见，组内（左页→右页）边界不检查休止；
   只有翻过右页进入下一组才是实体翻页，要求休止 >= 最低安全休止，
-  且只有实体翻页参与最短翻页休止最大化。
+  且只有实体翻页参与最短翻页休止最大化；
+- 人工断点：forced_break_after 中的系统之后必须分页，forbidden_break_after
+  中的系统之后禁止分页，两者在 DP 转移阶段直接裁剪分页边。强制分页只约束
+  页边界位置，不改变实体翻页判定：spread 组内（左页之后）的强制断点仍不
+  检查休止、不参与瓶颈，只有右页之后的断点才检查 min_safe_rest 并参与瓶颈。
 
 实现：两阶段精确 DP。
 - 阶段一：widest-path DP 求最大可行瓶颈 B*，同时得到各位置可达性；
@@ -22,16 +26,17 @@ spread 模式下 DP 状态额外携带已用页数奇偶：页码奇偶决定该
 无解诊断：
 - 若某系统自身高度超过页面可用高度，报告首个这样的系统（无法容纳）；
 - 否则取首个不可达位置 u（spread 模式指两种页数奇偶均不可达）。可以证明：
-  在所有系统都能单独容纳时，u 必然 < n 且边界 u-1 的休止不足
-  （否则从位置 u-1 单系统成页即可到达 u）；spread 模式下该边界必为实体翻页边界
-  （若可达状态使该页落在左页，则组内边界不检查休止，u 反而可达），
-  因此报告首个无法安全完成的实体翻页边界。
+  在所有系统都能单独容纳时，u 必然 < n，且单系统页 [u-1, u) 不跨过任何
+  强制断点、从可达的 u-1 出发只差一条分页边，因此边界 u-1 要么被
+  forbidden_break_after 禁止分页，要么休止不足（spread 模式下后一种情形
+  该边界必为实体翻页边界——若可达状态使该页落在左页，组内边界不检查休止，
+  u 反而可达），据此报告首个无法安全完成的边界。
 """
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 from math import inf
-from typing import Any, Optional
+from typing import Any, Iterable, Optional
 
 _EPS = 1e-9  # 浮点比较容差
 
@@ -51,6 +56,8 @@ def plan_pages(
     min_safe_rest: float,
     layout_mode: str = "single",
     spread_start_side: str = "left",
+    forced_break_after: Optional[Iterable[int]] = None,
+    forbidden_break_after: Optional[Iterable[int]] = None,
 ) -> dict[str, Any]:
     """生成完整分页方案；无解时抛出 InfeasibleError，不产生任何部分方案。"""
     n = len(system_heights)
@@ -62,6 +69,19 @@ def plan_pages(
         raise ValueError("layout_mode must be 'single' or 'spread'")
     if spread_start_side not in ("left", "right"):
         raise ValueError("spread_start_side must be 'left' or 'right'")
+
+    forced = set(forced_break_after or ())
+    forbidden = set(forbidden_break_after or ())
+    for b in sorted(forced | forbidden):
+        if not 0 <= b < n - 1:
+            raise ValueError(
+                f"断点下标 {b} 无效：只能在系统 0..{n - 2} 之后分页（末系统之后无需分页）"
+            )
+    conflict = sorted(forced & forbidden)
+    if conflict:
+        raise ValueError(
+            f"forced_break_after 与 forbidden_break_after 存在冲突下标: {conflict}"
+        )
 
     # 首个无法容纳的系统
     for i, h in enumerate(system_heights):
@@ -81,9 +101,17 @@ def plan_pages(
 
     if layout_mode == "spread":
         return _plan_spread(
-            system_heights, boundary_rests, page_height, min_safe_rest, spread_start_side
+            system_heights,
+            boundary_rests,
+            page_height,
+            min_safe_rest,
+            spread_start_side,
+            forced,
+            forbidden,
         )
-    return _plan_single(system_heights, boundary_rests, page_height, min_safe_rest)
+    return _plan_single(
+        system_heights, boundary_rests, page_height, min_safe_rest, forced, forbidden
+    )
 
 
 def _prefix_sums(system_heights: list[float]) -> list[float]:
@@ -93,15 +121,33 @@ def _prefix_sums(system_heights: list[float]) -> list[float]:
     return prefix
 
 
+def _earliest_starts(n: int, forced: set[int]) -> list[int]:
+    """earliest[j] = 页 [i, j) 不跨过任何强制断点的最小起始下标 i。
+
+    页 [i, j) 的内部边界为 i..j-2；强制断点 b 要求页边界必须落在系统 b 之后，
+    即任何页面不得同时包含系统 b 与 b+1，故 i 必须大于所有 <= j-2 的强制断点。
+    """
+    earliest = [0] * (n + 1)
+    max_forced = -1
+    for j in range(1, n + 1):
+        if j >= 2 and (j - 2) in forced:
+            max_forced = j - 2
+        earliest[j] = max_forced + 1
+    return earliest
+
+
 def _plan_single(
     system_heights: list[float],
     boundary_rests: list[float],
     page_height: float,
     min_safe_rest: float,
+    forced: set[int],
+    forbidden: set[int],
 ) -> dict[str, Any]:
     """single 模式：每次翻页都是实体翻页。"""
     n = len(system_heights)
     prefix = _prefix_sums(system_heights)
+    earliest = _earliest_starts(n, forced)
 
     def height(i: int, j: int) -> float:
         """系统 [i, j) 的总高度。"""
@@ -111,8 +157,10 @@ def _plan_single(
     widest = [-inf] * (n + 1)
     widest[0] = inf
     for j in range(1, n + 1):
+        if j < n and (j - 1) in forbidden:
+            continue  # 禁止在边界 j-1 分页，位置 j 不可作为页尾
         best = -inf
-        for i in range(j - 1, -1, -1):
+        for i in range(j - 1, earliest[j] - 1, -1):
             if height(i, j) > page_height + _EPS:
                 break  # 高度为正，i 再小只会更高
             if widest[i] == -inf:
@@ -125,23 +173,31 @@ def _plan_single(
         widest[j] = best
 
     if widest[n] == -inf:
-        # 首个不可达位置 u：因所有系统均可单独容纳，u <= n-1 且边界 u-1 休止不足
+        # 首个不可达位置 u：所有系统均可单独容纳，且单系统页不跨强制断点，
+        # 故边界 u-1 要么被禁止分页，要么休止不足
         u = next(k for k in range(1, n + 1) if widest[k] == -inf)
         b = u - 1
-        raise InfeasibleError(
-            reason="unsafe_boundary",
-            detail={
-                "boundary_index": b,
-                "between_systems": [b, b + 1],
-                "rest_seconds": boundary_rests[b],
-                "min_safe_rest": min_safe_rest,
-                "message": (
-                    f"边界 {b}（系统 {b} 与系统 {b + 1} 之间）的休止 "
-                    f"{boundary_rests[b]}s 低于最低安全休止 {min_safe_rest}s，"
-                    "此前区间无法安全断开"
-                ),
-            },
-        )
+        detail: dict[str, Any] = {
+            "boundary_index": b,
+            "between_systems": [b, b + 1],
+            "rest_seconds": boundary_rests[b],
+            "min_safe_rest": min_safe_rest,
+        }
+        if b in forbidden:
+            detail["forbidden_break"] = True
+            detail["message"] = (
+                f"边界 {b}（系统 {b} 与系统 {b + 1} 之间）被 forbidden_break_after "
+                "禁止分页，此前区间无法安全断开"
+            )
+        else:
+            if b in forced:
+                detail["forced_break"] = True
+            detail["message"] = (
+                f"边界 {b}（系统 {b} 与系统 {b + 1} 之间）的休止 "
+                f"{boundary_rests[b]}s 低于最低安全休止 {min_safe_rest}s，"
+                "此前区间无法安全断开"
+            )
+        raise InfeasibleError(reason="unsafe_boundary", detail=detail)
 
     bottleneck = widest[n]
 
@@ -150,7 +206,9 @@ def _plan_single(
     parent = [-1] * (n + 1)
     dp[0] = (0.0, 0)
     for j in range(1, n + 1):
-        for i in range(j - 1, -1, -1):
+        if j < n and (j - 1) in forbidden:
+            continue  # 禁止在边界 j-1 分页
+        for i in range(j - 1, earliest[j] - 1, -1):
             h = height(i, j)
             if h > page_height + _EPS:
                 break
@@ -204,14 +262,18 @@ def _plan_spread(
     page_height: float,
     min_safe_rest: float,
     spread_start_side: str,
+    forced: set[int],
+    forbidden: set[int],
 ) -> dict[str, Any]:
     """spread 模式：相邻左右页同组可见，仅翻过右页（实体翻页）才检查休止。
 
     DP 状态携带已用页数奇偶：第 k 页（0 起）的左右由 k 与 spread_start_side
-    共同决定，页码奇偶因此直接决定该页之后是否为实体翻页。
+    共同决定，页码奇偶因此直接决定该页之后是否为实体翻页。人工断点只约束
+    页边界位置：强制断点落在左页之后时仍是组内翻页，不检查休止、不参与瓶颈。
     """
     n = len(system_heights)
     prefix = _prefix_sums(system_heights)
+    earliest = _earliest_starts(n, forced)
 
     def height(i: int, j: int) -> float:
         """系统 [i, j) 的总高度。"""
@@ -227,7 +289,9 @@ def _plan_spread(
     widest = [[-inf, -inf] for _ in range(n + 1)]
     widest[0][0] = inf
     for j in range(1, n + 1):
-        for i in range(j - 1, -1, -1):
+        if j < n and (j - 1) in forbidden:
+            continue  # 禁止在边界 j-1 分页，位置 j 不可作为页尾
+        for i in range(j - 1, earliest[j] - 1, -1):
             if height(i, j) > page_height + _EPS:
                 break  # 高度为正，i 再小只会更高
             for q in (0, 1):
@@ -246,26 +310,34 @@ def _plan_spread(
                     widest[j][1 - q] = w
 
     if widest[n][0] == -inf and widest[n][1] == -inf:
-        # 首个两种页数奇偶均不可达的位置 u：边界 u-1 必为休止不足的实体翻页边界
+        # 首个两种页数奇偶均不可达的位置 u：边界 u-1 要么被禁止分页，
+        # 要么是休止不足的实体翻页边界
         u = next(
             k for k in range(1, n + 1) if widest[k][0] == -inf and widest[k][1] == -inf
         )
         b = u - 1
-        raise InfeasibleError(
-            reason="unsafe_boundary",
-            detail={
-                "boundary_index": b,
-                "between_systems": [b, b + 1],
-                "rest_seconds": boundary_rests[b],
-                "min_safe_rest": min_safe_rest,
-                "physical_turn": True,
-                "message": (
-                    f"边界 {b}（系统 {b} 与系统 {b + 1} 之间）是首个无法安全完成的实体翻页边界："
-                    f"此处必然结束一页右页、需要实体翻页，但休止 {boundary_rests[b]}s "
-                    f"低于最低安全休止 {min_safe_rest}s"
-                ),
-            },
-        )
+        detail: dict[str, Any] = {
+            "boundary_index": b,
+            "between_systems": [b, b + 1],
+            "rest_seconds": boundary_rests[b],
+            "min_safe_rest": min_safe_rest,
+        }
+        if b in forbidden:
+            detail["forbidden_break"] = True
+            detail["message"] = (
+                f"边界 {b}（系统 {b} 与系统 {b + 1} 之间）被 forbidden_break_after "
+                "禁止分页，此前区间无法安全断开"
+            )
+        else:
+            if b in forced:
+                detail["forced_break"] = True
+            detail["physical_turn"] = True
+            detail["message"] = (
+                f"边界 {b}（系统 {b} 与系统 {b + 1} 之间）是首个无法安全完成的实体翻页边界："
+                f"此处必然结束一页右页、需要实体翻页，但休止 {boundary_rests[b]}s "
+                f"低于最低安全休止 {min_safe_rest}s"
+            )
+        raise InfeasibleError(reason="unsafe_boundary", detail=detail)
 
     bottleneck = max(widest[n][0], widest[n][1])
 
@@ -274,7 +346,9 @@ def _plan_spread(
     parent: list[list[Optional[tuple[int, int]]]] = [[None, None] for _ in range(n + 1)]
     dp[0][0] = (0.0, 0)
     for j in range(1, n + 1):
-        for i in range(j - 1, -1, -1):
+        if j < n and (j - 1) in forbidden:
+            continue  # 禁止在边界 j-1 分页
+        for i in range(j - 1, earliest[j] - 1, -1):
             h = height(i, j)
             if h > page_height + _EPS:
                 break

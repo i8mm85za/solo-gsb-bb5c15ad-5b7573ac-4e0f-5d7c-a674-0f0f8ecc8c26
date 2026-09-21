@@ -247,3 +247,102 @@ def test_spread_single_system():
     assert res["pages"][0]["side"] == "right"
     assert res["pages"][0]["physical_turn_after"] is False
     assert res["min_turn_rest"] is None
+
+
+# ---- 人工断点约束（forced_break_after / forbidden_break_after）----
+
+
+def test_forced_break_after_splits_pages():
+    # 无约束时整曲一页即可放下；强制在系统 1 后分页 → [0,1]|[2,3]
+    res = plan_pages([5.0, 5.0, 5.0, 5.0], [9.0, 9.0, 9.0], 20.0, 1.0,
+                     forced_break_after=[1])
+    assert [(p["start_system"], p["end_system"]) for p in res["pages"]] == [(0, 1), (2, 3)]
+    assert res["pages"][0]["turn_rest_after"] == 9.0
+
+
+def test_forced_break_participates_in_bottleneck_single():
+    # single 模式强制断点处休止 3.0 成为全曲瓶颈（无约束时瓶颈为 9.0）
+    res = plan_pages([5.0, 5.0, 5.0], [3.0, 9.0], 10.0, 1.0, forced_break_after=[0])
+    assert res["min_turn_rest"] == 3.0
+    assert (res["pages"][0]["start_system"], res["pages"][0]["end_system"]) == (0, 0)
+
+
+def test_forced_break_after_requires_safe_rest_single():
+    # single 模式强制断点处休止不足 → 无解，诊断定位该边界并标注 forced_break
+    with pytest.raises(InfeasibleError) as exc:
+        plan_pages([5.0, 5.0, 5.0], [0.5, 9.0], 10.0, 1.0, forced_break_after=[0])
+    assert exc.value.reason == "unsafe_boundary"
+    assert exc.value.detail["boundary_index"] == 0
+    assert exc.value.detail["forced_break"] is True
+
+
+def test_forbidden_break_after_merges_pages():
+    # 禁止在系统 0 后分页 → 系统 0、1 必须同页
+    res = plan_pages([5.0, 5.0, 5.0], [9.0, 9.0], 10.0, 1.0,
+                     forbidden_break_after=[0])
+    assert [(p["start_system"], p["end_system"]) for p in res["pages"]] == [(0, 1), (2, 2)]
+
+
+def test_forbidden_break_after_infeasible_reported():
+    # 禁止在系统 0 后分页，但系统 0、1 无法同页 → 无解，诊断标注 forbidden_break
+    with pytest.raises(InfeasibleError) as exc:
+        plan_pages([6.0, 6.0, 6.0], [9.0, 9.0], 10.0, 1.0,
+                   forbidden_break_after=[0])
+    assert exc.value.reason == "unsafe_boundary"
+    assert exc.value.detail["boundary_index"] == 0
+    assert exc.value.detail["forbidden_break"] is True
+
+
+def test_break_constraints_conflict_rejected():
+    with pytest.raises(ValueError, match="冲突"):
+        plan_pages([5.0, 5.0], [9.0], 10.0, 1.0,
+                   forced_break_after=[0], forbidden_break_after=[0])
+
+
+def test_break_constraint_on_last_system_rejected():
+    with pytest.raises(ValueError):
+        plan_pages([5.0, 5.0], [9.0], 10.0, 1.0, forced_break_after=[1])
+    with pytest.raises(ValueError):
+        plan_pages([5.0, 5.0], [9.0], 10.0, 1.0, forbidden_break_after=[1])
+    with pytest.raises(ValueError):
+        plan_pages([5.0, 5.0], [9.0], 10.0, 1.0, forced_break_after=[5])
+
+
+def test_spread_forced_break_within_group_is_not_physical():
+    # 强制在系统 0 后分页：页 1（左页）组内断开，休止 0 也不检查、不参与瓶颈
+    res = plan_pages([6.0, 4.0], [0.0], 10.0, 5.0, layout_mode="spread",
+                     forced_break_after=[0])
+    assert res["page_count"] == 2
+    assert [p["side"] for p in res["pages"]] == ["left", "right"]
+    assert [p["physical_turn_after"] for p in res["pages"]] == [False, False]
+    assert res["pages"][0]["turn_rest_after"] is None
+    assert res["min_turn_rest"] is None
+
+
+def test_spread_forced_break_after_right_page_checks_rest():
+    # 强制在系统 0 后分页（组内，不检查）；此后唯一可行的实体翻页在右页之后，
+    # 休止达标则参与瓶颈，不足则无解
+    base = dict(
+        system_heights=[5.0, 5.0, 5.0, 5.0],
+        page_height=10.0,
+        min_safe_rest=1.0,
+        layout_mode="spread",
+        forced_break_after=[0],
+    )
+    res = plan_pages(**base, boundary_rests=[0.0, 0.5, 9.0])
+    assert [p["physical_turn_after"] for p in res["pages"]] == [False, True, False]
+    assert res["min_turn_rest"] == 9.0
+    with pytest.raises(InfeasibleError) as exc:
+        plan_pages(**base, boundary_rests=[0.0, 0.5, 0.5])
+    assert exc.value.detail["boundary_index"] == 1
+    assert exc.value.detail["physical_turn"] is True
+
+
+def test_spread_forbidden_break_diagnosis():
+    # 禁止分页的边界导致不可达时，诊断指出该约束而非休止
+    with pytest.raises(InfeasibleError) as exc:
+        plan_pages([6.0, 6.0], [9.0], 10.0, 1.0, layout_mode="spread",
+                   forbidden_break_after=[0])
+    assert exc.value.reason == "unsafe_boundary"
+    assert exc.value.detail["boundary_index"] == 0
+    assert exc.value.detail["forbidden_break"] is True

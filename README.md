@@ -10,6 +10,8 @@
   - `spread`：双页谱架，相邻左、右页组成一组同时可见，**组内（左页→右页）边界不检查休止**；
     只有**翻过右页**进入下一组才是实体翻页，要求休止 ≥ 最低安全休止，
     且只有实体翻页参与最短翻页休止最大化；
+- 支持人工断点约束：`forced_break_after` 指定的系统之后**必须分页**，
+  `forbidden_break_after` 指定的系统之后**禁止分页**；
 - 优化目标按字典序依次进行：
   1. **最大化**全曲最短的一次（实体）翻页休止（瓶颈值，越大越安全）；
   2. 在达到该瓶颈的方案中，**最小化各页留白高度的平方和**；
@@ -63,7 +65,16 @@ curl -X POST http://localhost:8000/plans \
 - `min_safe_rest`：最低安全休止秒数（非负）；
 - `layout_mode`：排版模式，`single`（默认）或 `spread`；
 - `spread_start_side`：`left`（默认）或 `right`，spread 模式下第 1 页所在的一侧，
-  之后左右交替；single 模式下忽略。
+  之后左右交替；single 模式下忽略；
+- `forced_break_after`：人工强制分页点（系统下标数组，默认 `[]`）——对应系统之后
+  **必须**分页；
+- `forbidden_break_after`：人工禁止分页点（系统下标数组，默认 `[]`）——对应系统之后
+  **不得**分页。
+
+两组断点约束的下标规则（违反时返回 `422` 并给出具体冲突）：
+
+- 下标指向末系统（其后无需分页）或越界 → `422`；
+- 同一系统同时出现在两组中 → `422`，错误信息列出冲突下标。
 
 成功返回 `201`（single 模式示例）：
 
@@ -125,6 +136,62 @@ curl -X POST http://localhost:8000/plans \
 }
 ```
 
+#### 人工断点约束示例
+
+```bash
+curl -X POST http://localhost:8000/plans \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "system_heights": [100, 100, 100, 100],
+    "boundary_rests": [5.0, 5.0, 5.0],
+    "page_height": 200,
+    "min_safe_rest": 1.0,
+    "forced_break_after": [1],
+    "forbidden_break_after": [2]
+  }'
+```
+
+系统 1 之后必须分页、系统 2 之后不得分页，唯一的分页点落在系统 1 之后；
+成功响应与后续 `GET /plans/{id}` 回放都会保留这两组约束：
+
+```json
+{
+  "forced_break_after": [1],
+  "forbidden_break_after": [2],
+  "page_count": 2,
+  "min_turn_rest": 5.0,
+  "pages": [
+    {"page": 1, "start_system": 0, "end_system": 1, "turn_rest_after": 5.0, "...": "..."},
+    {"page": 2, "start_system": 2, "end_system": 3, "turn_rest_after": null, "...": "..."}
+  ]
+}
+```
+
+约束语义：
+
+- 约束在动态规划转移阶段生效：禁止断点裁掉对应的分页边，强制断点要求页边界
+  必须落在该系统之后（任何页面不得同时包含该系统与下一系统）；
+- 强制分页只约束页边界位置，**不改变实体翻页判定**：spread 组内（左页之后）的
+  强制断点仍不检查休止、不参与瓶颈；只有右页之后的断点才检查 `min_safe_rest`
+  并参与瓶颈优化；
+- 约束导致无可行方案时沿用现有的 `422` 无解诊断且**不保存任何部分方案**；
+  若首个不可达的边界正是被禁止分页的边界，诊断中会带 `forbidden_break: true`，
+  若该边界同时是强制分页点则带 `forced_break: true`。
+
+断点冲突（同一系统既强制又禁止，或指向末系统）返回 `422`，并给出具体冲突：
+
+```json
+{
+  "detail": [
+    {
+      "type": "value_error",
+      "loc": ["body"],
+      "msg": "Value error, forced_break_after 与 forbidden_break_after 存在冲突下标: [2]"
+    }
+  ]
+}
+```
+
 无解返回 `422`，指出首个问题区间，且**不保存任何部分方案**：
 
 ```json
@@ -147,7 +214,8 @@ curl -X POST http://localhost:8000/plans \
 - `system_exceeds_page_height`：首个高度超过页面可用高度的系统（附 `system_index`），任何页面都无法容纳；
 - `unsafe_boundary`：首个无法安全断开的边界（附 `boundary_index` 与相邻系统下标）。
   spread 模式下该边界必为实体翻页边界（附 `physical_turn: true`）——若该页能落在左页，
-  组内边界本无需检查休止。
+  组内边界本无需检查休止。若该边界被 `forbidden_break_after` 禁止分页，
+  诊断附 `forbidden_break: true`；若该边界同时是强制分页点，附 `forced_break: true`。
 
 ### `GET /plans/{id}` — 查询完整方案
 
@@ -156,7 +224,8 @@ curl http://localhost:8000/plans/1
 ```
 
 不存在时返回 `404`。响应完整回放保存时的请求与结果，包括 `layout_mode`、
-`spread_start_side` 及逐页的 `side`、`physical_turn_after`。
+`spread_start_side`、`forced_break_after`、`forbidden_break_after` 及逐页的
+`side`、`physical_turn_after`。
 
 ### `GET /plans` — 列出方案摘要
 
@@ -187,7 +256,11 @@ python3 -m pytest tests/ -q
 - spread 模式下 DP 状态额外携带**已用页数奇偶**：第 1 页位于 `spread_start_side`，
   之后左右交替，页码奇偶因此决定该页之后是否为实体翻页（右页之后才是）。
   组内（左页→右页）边界不参与休止检查与瓶颈计算。
+- 人工断点在两阶段 DP 的转移阶段统一生效：禁止断点直接跳过对应的分页边；
+  强制断点通过预计算的"最早起始位置"裁剪所有跨过该断点的页面。强制分页不改变
+  实体翻页判定——spread 组内（左页之后）的强制断点仍不检查休止、不参与瓶颈。
 - 无解诊断：先检查首个超高的系统；否则取首个不可达位置（spread 模式指两种页数奇偶
-  均不可达）——可证明此时其左侧边界必然是无法安全完成的（实体）翻页边界。
+  均不可达）——可证明此时其左侧边界要么被 `forbidden_break_after` 禁止分页，
+  要么是无法安全完成的（实体）翻页边界。
 - 存储使用 SQLite（`app/storage.py`），请求与结果以 JSON 整体保存，
   只有成功生成的完整方案才会入库；新增字段随 JSON 自动持久化并可回放。

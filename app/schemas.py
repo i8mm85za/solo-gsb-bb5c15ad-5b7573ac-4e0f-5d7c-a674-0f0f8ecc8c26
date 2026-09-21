@@ -26,6 +26,14 @@ class PlanRequest(BaseModel):
         default="left",
         description="spread 模式下第 1 页所在的一侧（left/right，默认 left）；single 模式下忽略",
     )
+    forced_break_after: list[int] = Field(
+        default_factory=list,
+        description="人工强制分页点（系统下标数组，默认空）：对应系统之后必须分页",
+    )
+    forbidden_break_after: list[int] = Field(
+        default_factory=list,
+        description="人工禁止分页点（系统下标数组，默认空）：对应系统之后不得分页",
+    )
 
     @model_validator(mode="after")
     def _check_values(self) -> "PlanRequest":
@@ -38,6 +46,29 @@ class PlanRequest(BaseModel):
         if len(self.boundary_rests) != len(self.system_heights) - 1:
             raise ValueError(
                 "boundary_rests 的长度必须等于 len(system_heights) - 1"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _check_break_constraints(self) -> "PlanRequest":
+        n = len(self.system_heights)
+        for field_name, values in (
+            ("forced_break_after", self.forced_break_after),
+            ("forbidden_break_after", self.forbidden_break_after),
+        ):
+            for idx in values:
+                if idx < 0 or idx >= n:
+                    raise ValueError(
+                        f"{field_name} 包含越界下标 {idx}（系统下标范围为 0..{n - 1}）"
+                    )
+                if idx == n - 1:
+                    raise ValueError(
+                        f"{field_name} 指向末系统 {idx}：末系统之后无需分页，不允许设置断点"
+                    )
+        conflict = sorted(set(self.forced_break_after) & set(self.forbidden_break_after))
+        if conflict:
+            raise ValueError(
+                f"forced_break_after 与 forbidden_break_after 存在冲突下标: {conflict}"
             )
         return self
 
@@ -63,6 +94,8 @@ class PlanOut(BaseModel):
     min_safe_rest: float
     layout_mode: str = "single"
     spread_start_side: Optional[str] = None
+    forced_break_after: list[int] = Field(default_factory=list)
+    forbidden_break_after: list[int] = Field(default_factory=list)
     system_count: int
     page_count: int
     min_turn_rest: Optional[float] = None
